@@ -119,6 +119,26 @@ class MockDatabase {
     }
 }
 
+// Ollama API Integration
+async function callOllama(prompt, systemContext = "You are a helpful medical assistant.", isJSON = false) {
+    try {
+        const response = await axios.post('http://127.0.0.1:11434/api/generate', {
+            model: process.env.OLLAMA_MODEL || 'qwen3.5:latest',
+            prompt: prompt,
+            system: systemContext,
+            stream: false,
+            format: isJSON ? 'json' : undefined,
+        });
+        if (isJSON) {
+            return JSON.parse(response.data.response);
+        }
+        return response.data.response;
+    } catch (error) {
+        console.error('Ollama API Error:', error.message);
+        throw error;
+    }
+}
+
 // Database Setup
 let db;
 
@@ -284,108 +304,82 @@ app.post('/api/elevenlabs/tts', async (req, res) => {
     }
 });
 
-// Interaction Database (Mock)
-const INTERACTIONS_DB = {
-    'aspirin-warfarin': {
-        severity: 'High',
-        description: 'Increases the risk of bleeding. Aspirin has antiplatelet effects which can amplify the anticoagulant effect of Warfarin.',
-        recommendation: 'Avoid concurrent use unless monitored closely by a physician.'
-    },
-    'lisinopril-potassium': {
-        severity: 'Medium',
-        description: 'May causing hyperkalemia (high blood potassium levels).',
-        recommendation: 'Monitor potassium levels regularly.'
-    },
-    'ibuprofen-lisinopril': {
-        severity: 'Medium',
-        description: 'NSAIDs may reduce the antihypertensive effect of ACE inhibitors and increase risk of renal impairment.',
-        recommendation: 'Use lowest effective dose of NSAID and monitor blood pressure.'
-    }
-};
-
-app.post('/api/interactions', (req, res) => {
+// LLM Powered Drug Interaction Checker
+app.post('/api/interactions', async (req, res) => {
     const { drugs } = req.body;
     if (!drugs || !Array.isArray(drugs)) {
         return res.status(400).json({ error: 'Invalid input' });
     }
 
-    const normalizedDrugs = drugs.map(d => d.trim().toLowerCase()).filter(Boolean);
-    let foundInteraction = null;
-
-    for (let i = 0; i < normalizedDrugs.length; i++) {
-        for (let j = i + 1; j < normalizedDrugs.length; j++) {
-            const key1 = `${normalizedDrugs[i]}-${normalizedDrugs[j]}`;
-            const key2 = `${normalizedDrugs[j]}-${normalizedDrugs[i]}`;
-
-            if (INTERACTIONS_DB[key1]) foundInteraction = { ...INTERACTIONS_DB[key1], pair: [normalizedDrugs[i], normalizedDrugs[j]] };
-            if (INTERACTIONS_DB[key2]) foundInteraction = { ...INTERACTIONS_DB[key2], pair: [normalizedDrugs[i], normalizedDrugs[j]] };
-            if (foundInteraction) break;
+    try {
+        const systemContext = `You are a medical AI assistant checking for drug interactions.
+Analyze the provided list of medications and determine if there are any significant interactions.
+Respond strictly in valid JSON format matching this structure:
+{
+  "status": "warning" | "safe",
+  "data": {
+     "pair": ["drug1", "drug2"],
+     "severity": "High" | "Medium" | "Low",
+     "description": "Description of the interaction",
+     "recommendation": "What the patient should do"
+  } 
+}
+If there are no interactions, return {"status": "safe"}.`;
+        
+        const prompt = `Check interactions for these medications: ${drugs.join(', ')}`;
+        const result = await callOllama(prompt, systemContext, true);
+        
+        if (result.status === 'warning' && result.data) {
+            res.json({ status: 'warning', data: result.data });
+        } else {
+            res.json({ status: 'safe', message: 'No significant interactions found.' });
         }
-        if (foundInteraction) break;
-    }
-
-    if (foundInteraction) {
-        res.json({ status: 'warning', data: foundInteraction });
-    } else {
-        res.json({ status: 'safe', message: 'No significant interactions found in our database.' });
+    } catch (error) {
+        console.error("Interactions API Error:", error);
+        res.json({ status: 'safe', message: 'Interaction check unavailable at this time.' });
     }
 });
 
-// LLM Context Handler (Mocking a smart agent)
+// LLM Context Handler (Now powered by Ollama)
 app.post('/api/chat', async (req, res) => {
     const { text, context, history } = req.body;
 
-    // In a real app, we would send this `text` and `history` to OpenAI/Claude here.
-    // For this MVP with a specific API key format, we'll simulate the "Reasoning" engine.
+    try {
+        const systemContext = `You are a helpful medical assistant for a patient named John. Context of current UI: ${context}. 
+Respond strictly in valid JSON format:
+{
+  "text": "Your natural language response to the user",
+  "action": "Optional action command. Use 'ask_severity' if you need to know severity of a symptom. Use 'log_complete' if the user just provided symptom details and severity. Otherwise set to null."
+}`;
 
-    let responseText = "I'm listening. Tell me more.";
-    let action = null;
+        const prompt = `User says: "${text}". 
+History: ${JSON.stringify(history || [])}. 
+Respond in the required JSON format.`;
 
-    const normalizedText = text?.toLowerCase() || "";
-
-    if (context === 'symptom-log') {
-        if (normalizedText.includes('pain') || normalizedText.includes('hurt') || normalizedText.includes('ache')) {
-            responseText = "I've noted that. On a scale of 1 to 10, how severe is the pain?";
-            action = "ask_severity";
-        } else if (normalizedText.match(/\d+/)) {
-            // Assume number is severity
-            const severity = normalizedText.match(/\d+/)[0];
-            responseText = `Got it. Severity ${severity}. I've logged this symptom to your journal. Any other symptoms?`;
-
-            // Log to DB
+        const result = await callOllama(prompt, systemContext, true);
+        
+        let responseText = result.text || "I'm listening. Tell me more.";
+        let action = result.action || null;
+        
+        // Handle side-effects for certain actions
+        if (action === "log_complete" && context === "symptom-log") {
+            const severityMatch = text?.match(/\d+/);
+            const severity = severityMatch ? severityMatch[0] : 5;
             if (!req.isPrivacyMode) {
                 try {
                     const stmt = db.prepare('INSERT INTO symptoms (description, severity) VALUES (?, ?)');
-                    stmt.run(`Pain reported via voice`, severity);
+                    stmt.run(`Symptom reported via voice: ${text}`, severity);
                 } catch (e) { console.error(e); }
             } else {
                 console.log('[PRIVACY] Skipping Symptom Log');
             }
+        }
 
-            action = "log_complete";
-        } else {
-            responseText = "I'm ready to log. Describe your symptoms.";
-        }
-    } else if (context === 'med-prep') {
-        responseText = "I've pulled your health summary. Your BP has been slightly elevated this week. I've sent a detailed report to your secure inbox for Dr. Smith.";
-    } else {
-        // General Conversation
-        if (normalizedText.includes('dizzy') || normalizedText.includes('dizziness')) {
-            responseText = "Dizziness can be a side effect of Lisinopril. I'm logging this interaction. Please sit down and drink some water.";
-            // Log potential side effect
-            if (!req.isPrivacyMode) {
-                db.prepare('INSERT INTO symptoms (description, severity) VALUES (?, ?)').run('Dizziness (Side Effect)', 5);
-            } else {
-                console.log('[PRIVACY] Skipping Side Effect Log');
-            }
-        } else if (normalizedText.includes('hello') || normalizedText.includes('hi')) {
-            responseText = "Hello, John. I'm here to help manage your health. How are you feeling?";
-        } else {
-            responseText = "I understand. I've updated your daily log.";
-        }
+        res.json({ text: responseText, action });
+    } catch (error) {
+        console.error("Chat API Error:", error);
+        res.json({ text: "I'm sorry, I'm having trouble connecting to my AI backend. Please try again later.", action: null });
     }
-
-    res.json({ text: responseText, action });
 });
 
 // ========== NEW ENHANCED FEATURES API ENDPOINTS ==========
@@ -415,56 +409,51 @@ app.post('/api/symptoms/analyze', async (req, res) => {
         }
     }
 
-    // AI Analysis (mock - in production would use Claude/OpenAI)
-    const lowerSymptom = symptom.toLowerCase();
-    let analysis = '';
-    let severity = 'low';
-    let tags = [];
-    let followUp = [];
-
-    if (lowerSymptom.includes('dizz')) {
-        analysis = "Dizziness can be a side effect of your blood pressure medication (Lisinopril). It could also be related to your low potassium levels. I recommend sitting down and drinking water.";
-        severity = 'medium';
-        tags = ['dizziness', 'medication-side-effect', 'blood-pressure'];
-        followUp = [
-            { text: 'When did the dizziness start?', options: ['Just now', 'This morning', 'Yesterday', 'A few days ago'] },
-            { text: 'How severe is it on a scale of 1-10?', options: ['1-3 (Mild)', '4-6 (Moderate)', '7-10 (Severe)'] }
-        ];
-    } else if (lowerSymptom.includes('headache') || lowerSymptom.includes('head')) {
-        analysis = "Headaches can be related to blood pressure changes. Since you've had elevated BP readings, this could be connected. Monitor your blood pressure and note the time of day.";
-        severity = 'medium';
-        tags = ['headache', 'blood-pressure'];
-        followUp = [
-            { text: 'Where is the headache located?', options: ['Forehead', 'Temples', 'Back of head', 'All over'] }
-        ];
-    } else if (lowerSymptom.includes('fatigue') || lowerSymptom.includes('tired')) {
-        analysis = "Fatigue could be related to your diabetes management or low potassium. Make sure you're eating regularly and staying hydrated.";
-        severity = 'low';
-        tags = ['fatigue', 'diabetes', 'potassium'];
-    } else {
-        analysis = `I've logged your symptom: "${symptom}". I'll track this and look for patterns. If it persists or worsens, please contact your doctor.`;
-        severity = 'low';
-        tags = ['general'];
+    try {
+        const systemContext = `You are a medical AI assistant. Analyze the reported symptom and respond in strictly valid JSON format matching this structure:
+{
+  "analysis": "A brief explanation of what the symptom might mean and immediate advice.",
+  "severity": "low" | "medium" | "high",
+  "tags": ["array", "of", "relevant", "tags"],
+  "followUp": [{"text": "Follow-up question?", "options": ["Option 1", "Option 2"]}]
+}`;
+        const prompt = `Patient reports symptom: "${symptom}". Provide the analysis JSON.`;
+        const result = await callOllama(prompt, systemContext, true);
+        
+        res.json({
+            analysis: result.analysis || `Logged symptom: ${symptom}`,
+            severity: result.severity || 'low',
+            tags: result.tags || ['general'],
+            followUp: result.followUp || []
+        });
+    } catch (error) {
+        console.error("Analyze API Error:", error);
+        res.json({ 
+            analysis: `I've logged your symptom: "${symptom}". (AI analysis currently unavailable)`,
+            severity: 'low',
+            tags: ['general'],
+            followUp: []
+        });
     }
-
-    res.json({ analysis, severity, tags, followUp });
 });
 
-app.get('/api/symptoms/patterns', (req, res) => {
-    // Detect patterns in symptoms
+app.get('/api/symptoms/patterns', async (req, res) => {
     try {
         const symptoms = db.prepare('SELECT * FROM symptoms WHERE timestamp > datetime("now", "-7 days")').all();
-        const patterns = [];
+        if (!symptoms || symptoms.length === 0) return res.json([]);
 
-        // Count dizziness occurrences
-        const dizzinessCount = symptoms.filter(s => s.description.toLowerCase().includes('dizz')).length;
-        if (dizzinessCount >= 3) {
-            patterns.push({
-                message: `You've reported dizziness ${dizzinessCount} times this week. This is unusual for you and may be related to your blood pressure medication or low potassium levels. Consider contacting your doctor.`
-            });
-        }
-
-        res.json(patterns);
+        const systemContext = `You are a medical AI assistant analyzing a patient's recent symptoms.
+Look for any concerning patterns in the provided symptoms over the last 7 days.
+Respond strictly in valid JSON format matching this structure:
+{
+  "patterns": [
+    { "message": "Description of the pattern and a recommendation" }
+  ]
+}`;
+        const prompt = `Here are the symptoms reported in the last 7 days: ${JSON.stringify(symptoms)}. Analyze them for patterns.`;
+        const result = await callOllama(prompt, systemContext, true);
+        
+        res.json(result.patterns || []);
     } catch (error) {
         console.error('Error detecting patterns:', error);
         res.json([]);
@@ -504,18 +493,19 @@ app.get('/api/lab-results', (req, res) => {
 app.post('/api/lab-results/explain', async (req, res) => {
     const { testName, value, referenceRange, previousValue } = req.body;
 
-    let explanation = '';
-
-    // Mock AI explanation - in production would use Claude/OpenAI
-    if (testName === 'HbA1c') {
-        explanation = `Your HbA1c is ${value}%, down from ${previousValue}% last quarter. That's great progress! This test measures your average blood sugar over the past 3 months. You're in the prediabetic range, but moving in the right direction. Keep up with your current medications and lifestyle changes.`;
-    } else if (testName === 'Potassium') {
-        explanation = `Your potassium is ${value}, which is below the normal range. Low potassium can cause muscle weakness, fatigue, and irregular heartbeat. This might be related to your blood pressure medication. Contact your doctor today to discuss whether you need a potassium supplement or dietary changes.`;
-    } else {
-        explanation = `Your ${testName} is ${value}. Reference range is ${referenceRange}. ${previousValue ? `Previous value was ${previousValue}.` : ''}`;
+    try {
+        const systemContext = `You are a medical AI assistant. Explain the lab result to the patient in plain, easy-to-understand language. Respond strictly in valid JSON format:
+{
+  "explanation": "Your explanation here"
+}`;
+        const prompt = `Test Name: ${testName}\nCurrent Value: ${value}\nReference Range: ${referenceRange}\nPrevious Value: ${previousValue || 'N/A'}\nProvide the explanation JSON.`;
+        const result = await callOllama(prompt, systemContext, true);
+        
+        res.json({ explanation: result.explanation || `Your ${testName} is ${value}. Reference range is ${referenceRange}.` });
+    } catch (error) {
+        console.error("Lab Explain API Error:", error);
+        res.json({ explanation: `Your ${testName} is ${value}. Reference range is ${referenceRange}. (AI explanation currently unavailable)` });
     }
-
-    res.json({ explanation });
 });
 
 // Appointments API
@@ -540,42 +530,36 @@ app.get('/api/appointments', (req, res) => {
 app.post('/api/appointments/prepare', async (req, res) => {
     const { appointmentId, specialty } = req.body;
 
-    // Generate preparation data based on recent health data
-    const preparationData = {
-        summary: `Preparing for your ${specialty} appointment`,
-        keyTopics: [
-            'Recent blood pressure elevations (60% of mornings)',
-            'Dizziness episodes (3 times this week)',
-            'Medication adjustment needed for Lisinopril',
-            'Low potassium levels from recent lab work'
-        ],
-        suggestedQuestions: [
-            'Should we adjust my blood pressure medication due to morning elevations?',
-            'Could my dizziness be related to low potassium levels?',
-            'Do I need to add a potassium supplement?',
-            'What lifestyle changes can help stabilize my blood pressure?'
-        ],
-        recentSymptoms: [
-            { symptom: 'Dizziness', frequency: '3 times this week', severity: 'Moderate' },
-            { symptom: 'Morning headaches', frequency: '4 days this week', severity: 'Mild' }
-        ],
-        medications: [
-            { name: 'Lisinopril', dose: '10mg', frequency: 'Daily', adherence: '95%' },
-            { name: 'Metformin', dose: '500mg', frequency: 'Twice daily', adherence: '98%' }
-        ],
-        labResults: [
-            { test: 'Blood Pressure', value: '145/92 mmHg', status: 'Elevated', trend: 'Worsening' },
-            { test: 'Potassium', value: '3.2 mEq/L', status: 'Low', trend: 'Declining' }
-        ],
-        actionItems: [
-            'Bring updated medication list',
-            'Bring blood pressure log from past 2 weeks',
-            'Discuss potassium supplementation'
-        ],
-        voiceSummary: `Good morning! Let me help you prepare for your ${specialty} appointment. Based on your recent health data, here are the key topics to discuss: Your blood pressure has been elevated 60% of mornings. You've experienced dizziness 3 times this week, which could be related to your recent lab results showing low potassium. I recommend asking your doctor about adjusting your Lisinopril dosage and whether you need potassium supplementation.`
-    };
-
-    res.json(preparationData);
+    try {
+        const systemContext = `You are a medical AI assistant preparing a patient for an upcoming doctor's appointment. Respond strictly in valid JSON format matching this structure:
+{
+  "summary": "Brief summary",
+  "keyTopics": ["Topic 1", "Topic 2"],
+  "suggestedQuestions": ["Question 1", "Question 2"],
+  "recentSymptoms": [{"symptom": "Name", "frequency": "Often", "severity": "Mild"}],
+  "medications": [{"name": "Med Name", "dose": "10mg", "frequency": "Daily", "adherence": "95%"}],
+  "labResults": [{"test": "Test Name", "value": "123", "status": "Normal", "trend": "Stable"}],
+  "actionItems": ["Action 1", "Action 2"],
+  "voiceSummary": "A friendly summary intended to be spoken aloud"
+}`;
+        const prompt = `Prepare the patient for a ${specialty} appointment. Base it on typical common scenarios if no real data is provided.`;
+        const result = await callOllama(prompt, systemContext, true);
+        
+        res.json(result);
+    } catch (error) {
+        console.error("Prepare API Error:", error);
+        // Fallback to mock data
+        res.json({
+            summary: `Preparing for your ${specialty} appointment (AI fallback)`,
+            keyTopics: ['Discuss recent symptoms', 'Review current medications'],
+            suggestedQuestions: ['Are there any lifestyle changes I should make?'],
+            recentSymptoms: [],
+            medications: [],
+            labResults: [],
+            actionItems: ['Bring updated medication list'],
+            voiceSummary: `Let me help you prepare for your ${specialty} appointment. Please remember to bring your latest health records.`
+        });
+    }
 });
 
 app.post('/api/appointments/share', async (req, res) => {
@@ -763,31 +747,37 @@ app.post('/api/auth/voice-verify', (req, res) => {
 });
 
 // Check-in: Process Interaction
-app.post('/api/check-in/process', (req, res) => {
+app.post('/api/check-in/process', async (req, res) => {
     const { text, currentStep } = req.body;
-    const input = text.toLowerCase();
 
-    let nextQuestion = "";
-    let updatedData = {};
-    let isComplete = false;
+    try {
+        const systemContext = `You are a medical AI assistant conducting a daily check-in with a patient. 
+The check-in steps are: mood -> adherence -> symptoms -> vitalSigns.
+The patient is currently answering for the step: "${currentStep}". 
+Analyze the response and determine the next question.
+Respond strictly in valid JSON format matching this structure:
+{
+  "extractedData": "The extracted value for the current step (e.g. 'Feeling good', 'Taken all meds', 'No symptoms', '120/80')",
+  "nextQuestion": "The next empathetic and natural question to ask for the next step, or a closing message if this was the last step.",
+  "isComplete": boolean (true if this was the 'vitalSigns' step or if the check-in is over)
+}`;
+        const prompt = `Patient response: "${text}". Process this response for the ${currentStep} step.`;
+        const result = await callOllama(prompt, systemContext, true);
+        
+        let updatedData = {};
+        if (currentStep) {
+            updatedData[currentStep] = result.extractedData || text;
+        }
 
-    // Mock sequential health interrogation logic
-    if (currentStep === 'mood') {
-        updatedData.mood = text;
-        nextQuestion = "Understood. Have you taken your morning Metformin and Lisinopril today?";
-    } else if (currentStep === 'adherence') {
-        updatedData.adherence = text;
-        nextQuestion = "And any symptoms like dizziness or fatigue occurring today?";
-    } else if (currentStep === 'symptoms') {
-        updatedData.symptoms = text;
-        nextQuestion = "Lastly, did you record your blood pressure today? If so, what was the reading?";
-    } else if (currentStep === 'vitalSigns') {
-        updatedData.vitalSigns = text;
-        isComplete = true;
+        res.json({ 
+            nextQuestion: result.nextQuestion || "Thank you. Is there anything else you'd like to add?", 
+            updatedData, 
+            isComplete: result.isComplete || false 
+        });
+    } catch (error) {
+        console.error("Check-in Process Error:", error);
+        res.json({ nextQuestion: "I'm having trouble processing that right now. Can we continue this later?", updatedData: {}, isComplete: true });
     }
-
-    // In production, use LLM to extract data from 'text'
-    res.json({ nextQuestion, updatedData, isComplete });
 });
 
 // Export for Vercel
